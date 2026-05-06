@@ -20,7 +20,7 @@ function chunkWithOverlap(text, chunkSize, overlap) {
     return chunks;
 }
 
-async function loadCorpus(dir) {
+export async function loadCorpus(dir) {
     const files = await fs.promises.readdir(dir);
 
     const txtFiles = files.filter(file =>
