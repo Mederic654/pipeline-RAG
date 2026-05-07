@@ -123,7 +123,7 @@ ${query}`
 }
 
 
-async function ragQuery(question, options = {topK :5, verbose : false}){
+export async function ragQuery(question, options = {topK :5, verbose : false}){
     const timer = performance.now();
 
     const context = await retrieveContext(question, options.topK);
@@ -142,7 +142,7 @@ async function ragQuery(question, options = {topK :5, verbose : false}){
     return {
         answer : answer,
         sources : context.map(u => u.source),
-        chunks: context.map(u => u.chunk),
+        chunks: context,  //.map(u => u.chunk),
         metrics: metrics
     }
 }
