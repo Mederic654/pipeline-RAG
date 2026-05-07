@@ -1,5 +1,6 @@
 //import { loadCorpus } from "./scripts/create-index.js"; _______________________________________retiré plus besoin
 import 'dotenv/config';
+import {CircuitBreaker} from './CircuitBreaker.js';
 
 //_______________________________________Phase 4
 import { Pinecone } from '@pinecone-database/pinecone';
@@ -99,51 +100,90 @@ ${query}`
         }
     ];
 
-    const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${process.env.MISTRAL_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model: 'mistral-small-latest',
-            messages,
-            temperature: 0.1
-        })
-    });
+      const llmBreaker = new CircuitBreaker({ threshold: 5, timeout: 30000 }) 
+      const response = await llmBreaker.call(() => withRetry(() => callLLM(messages)));
 
-    if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`Erreur Mistral : ${response.status} - ${error}`);
-    }
 
-    const data = await response.json();
 
-    return data.choices[0].message.content;
+    return response;
 }
 
 
-export async function ragQuery(question, options = {topK :5, verbose : false}){
+export async function ragQuery(question, options = { topK: 5, verbose: false }) {
     const timer = performance.now();
 
     const context = await retrieveContext(question, options.topK);
     if (options.verbose) {
         console.log(`topK=${options.topK} retournés en ${performance.now() - timer}ms, top score ${Math.max(...context.map(u => u.score))}, avg score${context.reduce((sum, value) => sum + value.score, 0) / context.length}`);
         context.forEach((elm) =>
-            console.log(`[${elm.score}] ${elm.source}, "${elm.text}"`));                    
+            console.log(`[${elm.score}] ${elm.source}, "${elm.text}"`));
     }
 
     const answer = await generateCompletion(question, context);
 
     const metrics = {
-        topScore : Math.max(...context.map(u => u.score)),
-        avgScore : context.reduce((sum, value) => sum + value.score, 0) / context.length
+        topScore: Math.max(...context.map(u => u.score)),
+        avgScore: context.reduce((sum, value) => sum + value.score, 0) / context.length
     }
     return {
-        answer : answer,
-        sources : context.map(u => u.source),
+        answer: answer,
+        sources: context.map(u => u.source),
         chunks: context,  //.map(u => u.chunk),
         metrics: metrics
     }
 }
 
+async function callLLM(prompt, options = {}) {
+    const { timeout = 30000, model = 'mistral-large-latest' } = options;
+
+
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+        const timer = performance.now();
+
+        const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.MISTRAL_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({model, messages: prompt}),
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            const error = await response.text();
+            throw new Error(`API error ${response.status}: ${error}`);
+        }
+        const data = await response.json();
+        console.log(`[LLM] Réponse reçue en ${performance.now() - timer}ms`);
+        return data;
+
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError') {
+            throw new Error(`Timeout LLM après ${timeout}ms`)
+        }
+        throw error;
+    }  
+}
+
+async function withRetry(fn, maxRetries = 3, baseDelay = 1000) {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return await fn();
+            } catch (err) {
+                const isRetryable = err.message.includes('429') || err.message.includes('503');
+                const isLastAttempt = attempt === maxRetries;
+                if (!isRetryable || isLastAttempt) throw err;
+                const delay = Math.pow(2, attempt) * baseDelay + Math.random() * 500;
+                console.log(`[Retry] Tentative ${attempt + 1}/${maxRetries} dans
+                                               ${Math.round(delay)}ms`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
