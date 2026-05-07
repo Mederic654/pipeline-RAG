@@ -106,7 +106,7 @@ ${query}`
             'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-            model: 'mistral-medium-latest',
+            model: 'mistral-small-latest',
             messages,
             temperature: 0.1
         })
@@ -120,5 +120,30 @@ ${query}`
     const data = await response.json();
 
     return data.choices[0].message.content;
+}
+
+
+async function ragQuery(question, options = {topK :5, verbose : false}){
+    const timer = performance.now();
+
+    const context = await retrieveContext(question, options.topK);
+    if (options.verbose) {
+        console.log(`topK=${options.topK} retournés en ${performance.now() - timer}ms, top score ${Math.max(...context.map(u => u.score))}, avg score${context.reduce((sum, value) => sum + value.score, 0) / context.length}`);
+        context.forEach((elm) =>
+            console.log(`[${elm.score}] ${elm.source}, "${elm.text}"`));                    
+    }
+
+    const answer = await generateCompletion(question, context);
+
+    const metrics = {
+        topScore : Math.max(...context.map(u => u.score)),
+        avgScore : context.reduce((sum, value) => sum + value.score, 0) / context.length
+    }
+    return {
+        answer : answer,
+        sources : context.map(u => u.source),
+        chunks: context.map(u => u.chunk),
+        metrics: metrics
+    }
 }
 
