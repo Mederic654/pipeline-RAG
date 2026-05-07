@@ -1,6 +1,6 @@
 //import { loadCorpus } from "./scripts/create-index.js"; _______________________________________retiré plus besoin
 import 'dotenv/config';
-import {CircuitBreaker} from './CircuitBreaker.js';
+import { CircuitBreaker } from './CircuitBreaker.js';
 
 //_______________________________________Phase 4
 import { Pinecone } from '@pinecone-database/pinecone';
@@ -60,6 +60,7 @@ export async function retrieveContext(query, topK = 5) {
 
     const matches = results.matches ?? [];
 
+    computeConfidence(matches);
     return matches
         .map(match => ({
             text: match.metadata?.text,
@@ -100,8 +101,8 @@ ${query}`
         }
     ];
 
-      const llmBreaker = new CircuitBreaker({ threshold: 5, timeout: 30000 }) 
-      const response = await llmBreaker.call(() => withRetry(() => callLLM(messages)));
+    const llmBreaker = new CircuitBreaker({ threshold: 5, timeout: 30000 })
+    const response = await llmBreaker.call(() => withRetry(() => callLLM(messages)));
 
 
 
@@ -150,7 +151,7 @@ async function callLLM(prompt, options = {}) {
                 'Authorization': `Bearer ${process.env.MISTRAL_API_KEY}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({model, messages: prompt}),
+            body: JSON.stringify({ model, messages: prompt }),
             signal: controller.signal
         });
         clearTimeout(timeoutId);
@@ -169,21 +170,35 @@ async function callLLM(prompt, options = {}) {
             throw new Error(`Timeout LLM après ${timeout}ms`)
         }
         throw error;
-    }  
+    }
 }
 
 async function withRetry(fn, maxRetries = 3, baseDelay = 1000) {
-        for (let attempt = 0; attempt <= maxRetries; attempt++) {
-            try {
-                return await fn();
-            } catch (err) {
-                const isRetryable = err.message.includes('429') || err.message.includes('503');
-                const isLastAttempt = attempt === maxRetries;
-                if (!isRetryable || isLastAttempt) throw err;
-                const delay = Math.pow(2, attempt) * baseDelay + Math.random() * 500;
-                console.log(`[Retry] Tentative ${attempt + 1}/${maxRetries} dans
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            const isRetryable = err.message.includes('429') || err.message.includes('503');
+            const isLastAttempt = attempt === maxRetries;
+            if (!isRetryable || isLastAttempt) throw err;
+            const delay = Math.pow(2, attempt) * baseDelay + Math.random() * 500;
+            console.log(`[Retry] Tentative ${attempt + 1}/${maxRetries} dans
                                                ${Math.round(delay)}ms`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-            }
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
+}
+
+function computeConfidence(matches) {
+    const topScore = matches[0]?.score ?? 0;
+    const avgScore = matches.reduce((acc, m) => acc + m.score, 0) / matches.length * 100;
+
+    console.log(`Confiance contextuelle : ${Math.trunc(avgScore)}% (top match : ${topScore})`);
+
+    return {
+        topScore,
+        avgScore,
+        sufficient: topScore >= 0.85
+    }
+}
+
