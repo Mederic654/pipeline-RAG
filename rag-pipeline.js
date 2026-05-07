@@ -4,13 +4,64 @@ import { CircuitBreaker } from './CircuitBreaker.js';
 
 //_______________________________________Phase 4
 import { Pinecone } from '@pinecone-database/pinecone';
-
+import { performance } from 'node:perf_hooks';
 
 const pinecone = new Pinecone({
     apiKey: process.env.PINECONE_API_KEY
 });
 
 const index = pinecone.index(process.env.PINECONE_INDEX_NAME);
+
+
+const MODEL_PRICING = {
+    'mistral-large-latest': {
+        inputPer1M: 2.00,
+        outputPer1M: 6.00
+    },
+    'mistral-small-latest': {
+        inputPer1M: 0.20,
+        outputPer1M: 0.60
+    }
+};
+
+let sessionTotalUSD = 0;
+
+/**
+ * Calcule le coût d'une requête LLM.
+ * @param {number} promptTokens
+ * @param {number} completionTokens
+ * @param {string} model
+ * @returns {{ costUSD: number, promptTokens: number, completionTokens: number, model: string }}
+ */
+export function calculateCost(promptTokens, completionTokens, model = 'mistral-large-latest') {
+    const pricing = MODEL_PRICING[model];
+
+    if (!pricing) {
+        throw new Error(`Tarifs inconnus pour le modèle: ${model}`);
+    }
+
+    const inputPricePerToken = pricing.inputPer1M / 1_000_000;
+    const outputPricePerToken = pricing.outputPer1M / 1_000_000;
+
+    const costUSD =
+        (promptTokens * inputPricePerToken) +
+        (completionTokens * outputPricePerToken);
+
+    return {
+        costUSD,
+        promptTokens,
+        completionTokens,
+        model
+    };
+}
+
+export function getSessionTotalUSD() {
+    return sessionTotalUSD;
+}
+
+export function resetSessionTotalUSD() {
+    sessionTotalUSD = 0;
+}
 
 
 async function embedText(text) {
@@ -114,24 +165,38 @@ export async function ragQuery(question, options = { topK: 5, verbose: false }) 
     const timer = performance.now();
 
     const context = await retrieveContext(question, options.topK);
+
+    const topScore = context.length ? Math.max(...context.map(u => u.score)) : 0;
+    const avgScore = context.length
+        ? context.reduce((sum, value) => sum + value.score, 0) / context.length
+        : 0;
+
     if (options.verbose) {
-        console.log(`topK=${options.topK} retournés en ${performance.now() - timer}ms, top score ${Math.max(...context.map(u => u.score))}, avg score${context.reduce((sum, value) => sum + value.score, 0) / context.length}`);
-        context.forEach((elm) =>
-            console.log(`[${elm.score}] ${elm.source}, "${elm.text}"`));
+        console.log(
+            `topK=${options.topK} retournés en ${Math.round(performance.now() - timer)}ms, ` +
+            `top score ${topScore}, avg score ${avgScore}`
+        );
+
+        context.forEach((elm) => {
+            console.log(`[${elm.score}] ${elm.source}, "${elm.text}"`);
+        });
     }
 
-    const answer = await generateCompletion(question, context);
+    const completion = await generateCompletion(question, context);
 
     const metrics = {
-        topScore: Math.max(...context.map(u => u.score)),
-        avgScore: context.reduce((sum, value) => sum + value.score, 0) / context.length
-    }
+        topScore,
+        avgScore
+    };
+
     return {
-        answer: answer,
+        answer: completion.text,
         sources: context.map(u => u.source),
-        chunks: context,  //.map(u => u.chunk),
-        metrics: metrics
-    }
+        chunks: context,
+        metrics,
+        usage: completion.usage,
+        cost: completion.cost
+    };
 }
 
 async function callLLM(prompt, options = {}) {
@@ -161,8 +226,39 @@ async function callLLM(prompt, options = {}) {
             throw new Error(`API error ${response.status}: ${error}`);
         }
         const data = await response.json();
-        console.log(`[LLM] Réponse reçue en ${performance.now() - timer}ms`);
-        return data;
+
+        // usage retourné par Mistral
+        const usage = data.usage ?? {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0
+        };
+
+        const costInfo = calculateCost(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            model
+        );
+
+        sessionTotalUSD += costInfo.costUSD;
+
+        console.log(`[LLM] Réponse reçue en ${Math.round(performance.now() - timer)}ms`);
+        console.log(
+            `[Stats] Input: ${usage.prompt_tokens} tokens\n` +
+            `Output: ${usage.completion_tokens} tokens\n` +
+            `Coût: $${costInfo.costUSD.toFixed(4)}\n` +
+            `Session total: $${sessionTotalUSD.toFixed(4)}`
+        );
+
+        return {
+            raw: data,
+            text: data?.choices?.[0]?.message?.content ?? '',
+            usage,
+            cost: {
+                ...costInfo,
+                sessionTotalUSD
+            }
+        };
 
     } catch (error) {
         clearTimeout(timeoutId);
@@ -178,11 +274,11 @@ async function withRetry(fn, maxRetries = 3, baseDelay = 1000) {
         try {
             return await fn();
         } catch (err) {
-            const isRetryable = err.message.includes('429') || err.message.includes('503');
+                const isRetryable = err.message.includes('429') || err.message.includes('503');
             const isLastAttempt = attempt === maxRetries;
-            if (!isRetryable || isLastAttempt) throw err;
+                if (!isRetryable || isLastAttempt) throw err;
             const delay = Math.pow(2, attempt) * baseDelay + Math.random() * 500;
-            console.log(`[Retry] Tentative ${attempt + 1}/${maxRetries} dans
+                console.log(`[Retry] Tentative ${attempt + 1}/${maxRetries} dans
                                                ${Math.round(delay)}ms`);
             await new Promise(resolve => setTimeout(resolve, delay));
         }
